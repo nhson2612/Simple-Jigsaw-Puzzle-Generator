@@ -1,123 +1,257 @@
+import grpc
+from concurrent import futures
+import mask_service_pb2
+import mask_service_pb2_grpc
 from PIL import Image, ImageDraw, ImageOps
+import io
+import logging
 
-def draw_puzzle_piece(PIECE_SIZE, TAB_SIZE, edges):
-    top, right, bottom, left = edges
-    total_size = PIECE_SIZE + 2 * TAB_SIZE
+class MaskServiceServicer(mask_service_pb2_grpc.MaskServiceServicer):
+    def ApplyMask(self, request, context):
+        try:
+            image_data = io.BytesIO(request.image_data)
+            image = Image.open(image_data).convert("RGBA")
+            
+            mask = self.create_puzzle_mask(
+                edges=request.edges,
+                piece_size=request.piece_size,
+                tab_size=request.tab_size
+            )
+            
+            result_image = self.apply_mask(
+                image=image,
+                mask=mask,
+                x=request.x,
+                y=request.y,
+                piece_size=request.piece_size,
+                tab_size=request.tab_size
+            )
+            
+            result_bytes = io.BytesIO()
+            result_image.save(result_bytes, format="PNG")
+            result_bytes.seek(0)
+            
+            return mask_service_pb2.MaskResponse(
+                result_image_data=result_bytes.read()
+            )
+            
+        except Exception as e:
+            logging.error(f"Error in ApplyMask: {str(e)}")
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(e))
+            return mask_service_pb2.MaskResponse()
 
-    # Tạo ảnh gốc màu trắng
-    original = Image.new('RGB', (PIECE_SIZE, PIECE_SIZE), 'white')
-    img = Image.new('RGB', (total_size, total_size), 'black')
-    img.paste(original, (TAB_SIZE, TAB_SIZE))
+    def create_puzzle_mask(self, edges, piece_size, tab_size):
+        top, right, bottom, left = edges
+        extra_padding = 10  # Tăng padding để tránh cắt mất tab
+        total_size = piece_size + 2 * (tab_size + extra_padding)
+        
+        mask = Image.new('L', (total_size, total_size), 0)
+        draw = ImageDraw.Draw(mask)
+        
+        center_box = [
+            tab_size + extra_padding,
+            tab_size + extra_padding,
+            tab_size + extra_padding + piece_size,
+            tab_size + extra_padding + piece_size
+        ]
+        draw.rectangle(center_box, fill=255)
+        
+        def draw_jigsaw_tab(direction, tab_type):
+            if tab_type == 0:
+                return
+            
+            neck_width = tab_size * 0.5
+            head_size = tab_size * 0.7
+            neck_length = tab_size * 0.5
+            
+            if direction == 'top':
+                center_x = tab_size + extra_padding + piece_size // 2
+                if tab_type == 1:  # Protruding tab
+                    neck_points = [
+                        (center_x - neck_width / 2, tab_size + extra_padding),
+                        (center_x + neck_width / 2, tab_size + extra_padding),
+                        (center_x + neck_width / 2, tab_size + extra_padding - neck_length),
+                        (center_x - neck_width / 2, tab_size + extra_padding - neck_length)
+                    ]
+                    head_box = [
+                        center_x - head_size / 2,
+                        tab_size + extra_padding - neck_length - head_size / 2,
+                        center_x + head_size / 2,
+                        tab_size + extra_padding - neck_length + head_size / 2
+                    ]
+                    draw.polygon(neck_points, fill=255)
+                    draw.ellipse(head_box, fill=255)
+                else:  # Inset groove
+                    neck_points = [
+                        (center_x - neck_width / 2, tab_size + extra_padding),
+                        (center_x + neck_width / 2, tab_size + extra_padding),
+                        (center_x + neck_width / 2, tab_size + extra_padding + neck_length),
+                        (center_x - neck_width / 2, tab_size + extra_padding + neck_length)
+                    ]
+                    head_box = [
+                        center_x - head_size / 2,
+                        tab_size + extra_padding + neck_length - head_size / 2,
+                        center_x + head_size / 2,
+                        tab_size + extra_padding + neck_length + head_size / 2
+                    ]
+                    draw.polygon(neck_points, fill=0)
+                    draw.ellipse(head_box, fill=0)
+            
+            elif direction == 'right':
+                center_y = tab_size + extra_padding + piece_size // 2
+                if tab_type == 1:
+                    neck_points = [
+                        (tab_size + extra_padding + piece_size, center_y - neck_width / 2),
+                        (tab_size + extra_padding + piece_size, center_y + neck_width / 2),
+                        (tab_size + extra_padding + piece_size + neck_length, center_y + neck_width / 2),
+                        (tab_size + extra_padding + piece_size + neck_length, center_y - neck_width / 2)
+                    ]
+                    head_box = [
+                        tab_size + extra_padding + piece_size + neck_length - head_size / 2,
+                        center_y - head_size / 2,
+                        tab_size + extra_padding + piece_size + neck_length + head_size / 2,
+                        center_y + head_size / 2
+                    ]
+                    draw.polygon(neck_points, fill=255)
+                    draw.ellipse(head_box, fill=255)
+                else:
+                    neck_points = [
+                        (tab_size + extra_padding + piece_size, center_y - neck_width / 2),
+                        (tab_size + extra_padding + piece_size, center_y + neck_width / 2),
+                        (tab_size + extra_padding + piece_size - neck_length, center_y + neck_width / 2),
+                        (tab_size + extra_padding + piece_size - neck_length, center_y - neck_width / 2)
+                    ]
+                    head_box = [
+                        tab_size + extra_padding + piece_size - neck_length - head_size / 2,
+                        center_y - head_size / 2,
+                        tab_size + extra_padding + piece_size - neck_length + head_size / 2,
+                        center_y + head_size / 2
+                    ]
+                    draw.polygon(neck_points, fill=0)
+                    draw.ellipse(head_box, fill=0)
+            
+            elif direction == 'bottom':
+                center_x = tab_size + extra_padding + piece_size // 2
+                if tab_type == 1:
+                    neck_points = [
+                        (center_x - neck_width / 2, tab_size + extra_padding + piece_size),
+                        (center_x + neck_width / 2, tab_size + extra_padding + piece_size),
+                        (center_x + neck_width / 2, tab_size + extra_padding + piece_size + neck_length),
+                        (center_x - neck_width / 2, tab_size + extra_padding + piece_size + neck_length)
+                    ]
+                    head_box = [
+                        center_x - head_size / 2,
+                        tab_size + extra_padding + piece_size + neck_length - head_size / 2,
+                        center_x + head_size / 2,
+                        tab_size + extra_padding + piece_size + neck_length + head_size / 2
+                    ]
+                    draw.polygon(neck_points, fill=255)
+                    draw.ellipse(head_box, fill=255)
+                else:
+                    neck_points = [
+                        (center_x - neck_width / 2, tab_size + extra_padding + piece_size),
+                        (center_x + neck_width / 2, tab_size + extra_padding + piece_size),
+                        (center_x + neck_width / 2, tab_size + extra_padding + piece_size - neck_length),
+                        (center_x - neck_width / 2, tab_size + extra_padding + piece_size - neck_length)
+                    ]
+                    head_box = [
+                        center_x - head_size / 2,
+                        tab_size + extra_padding + piece_size - neck_length - head_size / 2,
+                        center_x + head_size / 2,
+                        tab_size + extra_padding + piece_size - neck_length + head_size / 2
+                    ]
+                    draw.polygon(neck_points, fill=0)
+                    draw.ellipse(head_box, fill=0)
+            
+            elif direction == 'left':
+                center_y = tab_size + extra_padding + piece_size // 2
+                if tab_type == 1:
+                    neck_points = [
+                        (tab_size + extra_padding, center_y - neck_width / 2),
+                        (tab_size + extra_padding, center_y + neck_width / 2),
+                        (tab_size + extra_padding - neck_length, center_y + neck_width / 2),
+                        (tab_size + extra_padding - neck_length, center_y - neck_width / 2)
+                    ]
+                    head_box = [
+                        tab_size + extra_padding - neck_length - head_size / 2,
+                        center_y - head_size / 2,
+                        tab_size + extra_padding - neck_length + head_size / 2,
+                        center_y + head_size / 2
+                    ]
+                    draw.polygon(neck_points, fill=255)
+                    draw.ellipse(head_box, fill=255)
+                else:
+                    neck_points = [
+                        (tab_size + extra_padding, center_y - neck_width / 2),
+                        (tab_size + extra_padding, center_y + neck_width / 2),
+                        (tab_size + extra_padding + neck_length, center_y + neck_width / 2),
+                        (tab_size + extra_padding + neck_length, center_y - neck_width / 2)
+                    ]
+                    head_box = [
+                        tab_size + extra_padding + neck_length - head_size / 2,
+                        center_y - head_size / 2,
+                        tab_size + extra_padding + neck_length + head_size / 2,
+                        center_y + head_size / 2
+                    ]
+                    draw.polygon(neck_points, fill=0)
+                    draw.ellipse(head_box, fill=0)
+        
+        if top != 0:
+            draw_jigsaw_tab('top', top)
+        if right != 0:
+            draw_jigsaw_tab('right', right)
+        if bottom != 0:
+            draw_jigsaw_tab('bottom', bottom)
+        if left != 0:
+            draw_jigsaw_tab('left', left)
+        
+        return mask
 
-    draw = ImageDraw.Draw(img)
+    def apply_mask(self, image, mask, x, y, piece_size, tab_size):
+        padding = tab_size + 10
+        new_width = image.width + 2 * padding
+        new_height = image.height + 2 * padding
+        padded_image = Image.new('RGBA', (new_width, new_height), (0, 0, 0, 0))
+        padded_image.paste(image, (padding, padding)) 
+        alpha = Image.new('L', (new_width, new_height), 0)
+        alpha.paste(mask, (x , y )) 
 
-    def draw_tab_arc(direction, tab_type):
-        radius = TAB_SIZE
-        if direction == 'top':
-            center = (TAB_SIZE + PIECE_SIZE // 2, TAB_SIZE)
-            bbox = [center[0]-radius, center[1]-radius,
-                    center[0]+radius, center[1]+radius]
-            if tab_type == 1:
-                draw.pieslice(bbox, 180, 360, fill='white')
-            else:
-                mask = Image.new('L', img.size, 0)
-                ImageDraw.Draw(mask).pieslice(bbox, 0, 180, fill=255)
-                img.paste('black', mask=mask)
+        result = padded_image.copy()
+        result.putalpha(alpha)
 
-        elif direction == 'bottom':
-            center = (TAB_SIZE + PIECE_SIZE // 2, TAB_SIZE + PIECE_SIZE)
-            bbox = [center[0]-radius, center[1]-radius,
-                    center[0]+radius, center[1]+radius]
-            if tab_type == 1:
-                draw.pieslice(bbox, 0, 180, fill='white')
-            else:
-                mask = Image.new('L', img.size, 0)
-                ImageDraw.Draw(mask).pieslice(bbox, 180, 0, fill=255)
-                img.paste('black', mask=mask)
+        # alpha = Image.new('L', image.size, 0)
+        # alpha.paste(mask, (x, y))
+        # result = image.copy()
+        # result.putalpha(alpha)
+        # bbox = result.getbbox()
+        # if bbox:
+        #     cropped = result.crop(bbox)
+        #     # Tính final_size động để đảm bảo đủ chỗ cho tab
+        #     neck_length = tab_size * 0.5
+        #     head_size = tab_size * 0.7
+        #     final_size = piece_size + 2 * (neck_length + head_size / 2) + 20  # +20 để dư padding
+            
+        #     final_size = int(final_size)
+        #     centered = Image.new('RGBA', (final_size, final_size), (0, 0, 0, 0))
+        #     paste_x = (final_size - cropped.width) // 2
+        #     paste_y = (final_size - cropped.height) // 2
+        #     centered.paste(cropped, (paste_x, paste_y))
+        #     return centered
+        return result
 
-        elif direction == 'left':
-            center = (TAB_SIZE, TAB_SIZE + PIECE_SIZE // 2)
-            bbox = [center[0]-radius, center[1]-radius,
-                    center[0]+radius, center[1]+radius]
-            if tab_type == 1:
-                draw.pieslice(bbox, 450, 270, fill='white')
-            else:
-                mask = Image.new('L', img.size, 0)
-                ImageDraw.Draw(mask).pieslice(bbox, 270, 450, fill=255)
-                img.paste('black', mask=mask)
+def serve():
+    logging.basicConfig(level=logging.INFO)
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    mask_service_pb2_grpc.add_MaskServiceServicer_to_server(
+        MaskServiceServicer(), server)
+    server.add_insecure_port('[::]:50051')
+    server.start()
+    logging.info("Server running on port 50051")
+    try:
+        server.wait_for_termination()
+    except KeyboardInterrupt:
+        server.stop(0)
 
-        elif direction == 'right':
-            center = (TAB_SIZE + PIECE_SIZE, TAB_SIZE + PIECE_SIZE // 2)
-            bbox = [center[0]-radius, center[1]-radius,
-                    center[0]+radius, center[1]+radius]
-            if tab_type == 1:
-                draw.pieslice(bbox, 270, 90, fill='white')
-            else:
-                mask = Image.new('L', img.size, 0)
-                ImageDraw.Draw(mask).pieslice(bbox, 90, 270, fill=255)
-                img.paste('black', mask=mask)
-
-    if top != 0: draw_tab_arc('top', top)
-    if right != 0: draw_tab_arc('right', right)
-    if bottom != 0: draw_tab_arc('bottom', bottom)
-    if left != 0: draw_tab_arc('left', left)
-
-    return img
-
-from PIL import Image
-
-# ==== Danh sách cấu hình edges và tọa độ ====
-configs = [
-    ([0, 1, -1, 0], (0, 0)),
-    ([0, -1, 1, -1], (100, 0)),
-    ([0, -1, 1, 1], (200, 0)),
-    ([0, 1, -1, 1], (300, 0)),
-    ([0, 0, 1, -1], (400, 0)),
-    ([1, -1, -1, 0], (0, 100)),
-    ([-1, -1, -1, 1], (100, 100)),
-    ([-1, -1, 1, 1], (200, 100)),
-    ([1, -1, 1, 1], (300, 100)),
-    ([-1, 0, -1, 1], (400, 100)),
-    ([1, 1, -1, 0], (0, 200)),
-    ([1, -1, -1, -1], (100, 200)),
-    ([-1, 1, 1, 1], (200, 200)),
-    ([-1, 1, 1, -1], (300, 200)),
-    ([1, 0, -1, -1], (400, 200)),
-    ([1, -1, 1, 0], (0, 300)),
-    ([1, 1, -1, 1], (100, 300)),
-    ([-1, -1, 1, -1], (200, 300)),
-    ([-1, 1, 1, 1], (300, 300)),
-    ([1, 0, -1, -1], (400, 300)),
-    ([-1, 1, 0, 0], (0, 400)),
-    ([1, -1, 0, -1], (100, 400)),
-    ([-1, 1, 0, 1], (200, 400)),
-    ([-1, 1, 0, -1], (300, 400)),
-    ([1, 0, 0, -1], (400, 400)),
-]
-
-# ==== Load ảnh gốc lớn ====
-background = Image.open(r"C:\Users\Administrator.DESKTOP-98TGIBL\Downloads\output.png").convert('RGBA')
-
-# ==== Thông số puzzle ====
-PIECE_SIZE = 100
-TAB_SIZE = 33
-
-# ==== Duyệt từng config ====
-for idx, (edges, (x, y)) in enumerate(configs):
-    # Tạo mask trắng đen từ edges
-    mask = draw_puzzle_piece(PIECE_SIZE, TAB_SIZE, edges)
-
-    # Tạo mask phủ toàn ảnh
-    full_mask = Image.new('L', background.size, 0)
-    full_mask.paste(mask, (x, y))
-
-    # Áp mask lên ảnh gốc
-    cut_out = Image.new('RGBA', background.size, (0, 0, 0, 0))
-    cut_out.paste(background, (0, 0), full_mask)
-
-    # Cắt vùng đúng bằng kích thước mask
-    box = (x, y, x + mask.width, y + mask.height)
-    cropped_result = cut_out.crop(box)
-
-    # Lưu ảnh
-    cropped_result.save(f"piece_{idx:02d}.png")
+if __name__ == '__main__':
+    serve()
